@@ -1,10 +1,28 @@
 import os
 import re
+import hmac
+import hashlib
+import base64
+import time
 from urllib.parse import urlparse
 from flask import Flask, Response, request, render_template, abort, stream_with_context
 import requests
+from dotenv import load_dotenv
+
+# تحميل متغيرات البيئة من ملف .env
+load_dotenv()
 
 app = Flask(__name__)
+
+# ═══════════════════════════════════════════════════════════
+#  إعدادات الأمان
+# ═══════════════════════════════════════════════════════════
+SECRET_KEY = os.environ.get('PROXY_SECRET')
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+    raise RuntimeError('PROXY_SECRET must be set and at least 32 chars long')
+
+TOKEN_TTL = 3600  # صلاحية الرابط بالثواني (ساعة)
+
 
 # ═══════════════════════════════════════════════════════════
 #  إعدادات الدروس
@@ -15,7 +33,7 @@ LESSONS_CONFIG = {
         'referer': 'https://ahmedelbeshbeshy.com/'
     },
     'sha3t-dars2': {
-        'base_url': 'https://vz-112ff3dc-c1b.b-cdn.net/e08412be-#ede5-4db4-98bc-caa60bd41a28/',
+        'base_url': 'https://vz-112ff3dc-c1b.b-cdn.net/e08412be-ede5-4db4-98bc-caa60bd41a28/',
         'referer': 'https://sha3t.ta3allm.com/'
     },
     'misshanaa-foundation': {
@@ -30,6 +48,55 @@ LESSONS_CONFIG = {
 
 
 # ═══════════════════════════════════════════════════════════
+#  دوال التشفير والتوقيع
+# ═══════════════════════════════════════════════════════════
+def _sign(payload: str) -> str:
+    """توقيع HMAC-SHA256"""
+    return hmac.new(
+        SECRET_KEY.encode(),
+        payload.encode(),
+        hashlib.sha256
+    ).hexdigest()[:16]
+
+
+def encode_path(lesson_id: str, file_path: str) -> str:
+    """يشفّر (lesson_id + file_path + timestamp) في token واحد"""
+    ts = str(int(time.time()))
+    payload = f"{lesson_id}|{file_path}|{ts}"
+    b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip('=')
+    sig = _sign(b64)
+    return f"{b64}.{sig}"
+
+
+def decode_path(token: str):
+    """يفك تشفير التوكن ويرجّع (lesson_id, file_path)"""
+    try:
+        b64, sig = token.rsplit('.', 1)
+    except ValueError:
+        abort(400, description='Invalid token')
+
+    expected_sig = _sign(b64)
+    if not hmac.compare_digest(sig, expected_sig):
+        abort(403, description='Invalid signature')
+
+    b64 += '=' * (-len(b64) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(b64.encode()).decode()
+    except Exception:
+        abort(400, description='Invalid token payload')
+
+    try:
+        lesson_id, file_path, ts = payload.split('|', 2)
+    except ValueError:
+        abort(400, description='Invalid token structure')
+
+    if time.time() - int(ts) > TOKEN_TTL:
+        abort(410, description='Token expired')
+
+    return lesson_id, file_path
+
+
+# ═══════════════════════════════════════════════════════════
 #  الصفحة الرئيسية
 # ═══════════════════════════════════════════════════════════
 @app.route('/')
@@ -38,10 +105,26 @@ def index():
 
 
 # ═══════════════════════════════════════════════════════════
-#  Proxy: /proxy/<lesson_id>/<path:file_path>
+#  نقطة الوصول المشفرة
+# ═══════════════════════════════════════════════════════════
+@app.route('/api/v/<token>')
+def proxy_token(token):
+    lesson_id, file_path = decode_path(token)
+    return _do_proxy(lesson_id, file_path)
+
+
+# ═══════════════════════════════════════════════════════════
+#  نقطة الوصول القديمة (للتوافق)
 # ═══════════════════════════════════════════════════════════
 @app.route('/proxy/<lesson_id>/<path:file_path>')
 def proxy(lesson_id, file_path):
+    return _do_proxy(lesson_id, file_path)
+
+
+# ═══════════════════════════════════════════════════════════
+#  دالة البروكسي الأساسية
+# ═══════════════════════════════════════════════════════════
+def _do_proxy(lesson_id, file_path):
     config = LESSONS_CONFIG.get(lesson_id)
     if not config:
         abort(404, description='Lesson not found')
@@ -49,7 +132,6 @@ def proxy(lesson_id, file_path):
     target_url = config['base_url'] + file_path
     print(f'→ Proxying: {target_url}')
 
-    # تجهيز الترويسات
     referer_parsed = urlparse(config['referer'])
     headers = {
         'Referer': config['referer'],
@@ -59,7 +141,6 @@ def proxy(lesson_id, file_path):
         'Accept-Language': 'ar,en;q=0.9',
     }
 
-    # تمرير Range لو موجود (مهم للـ seek)
     if 'Range' in request.headers:
         headers['Range'] = request.headers['Range']
 
@@ -83,15 +164,11 @@ def proxy(lesson_id, file_path):
     is_m3u8 = file_path.endswith('.m3u8') or 'mpegurl' in content_type.lower()
 
     # ═════════════════════════════════════════════════════
-    #  إعادة كتابة ملفات m3u8
-    #  مع الحفاظ على المسار الفرعي (480p/، 720p/...)
+    #  إعادة كتابة ملفات m3u8 (روابط مشفرة)
     # ═════════════════════════════════════════════════════
     if is_m3u8:
         text = upstream.text
 
-        # استخراج المجلد الحالي من مسار الملف
-        # مثال: file_path = "480p/video.m3u8" → base_dir = "480p/"
-        # مثال: file_path = "playlist.m3u8"   → base_dir = ""
         if '/' in file_path:
             base_dir = file_path.rsplit('/', 1)[0] + '/'
         else:
@@ -110,34 +187,36 @@ def proxy(lesson_id, file_path):
 
             # سطر تعليق أو خاصية
             if stripped.startswith('#'):
-                # معالجة URI داخل الوسوم
                 if 'URI="' in stripped:
                     def replace_uri(match):
                         uri = match.group(1)
                         if uri.startswith('http'):
                             return match.group(0)
-                        return f'URI="/proxy/{lesson_id}/{base_dir}{uri}"'
+                        t = encode_path(lesson_id, f"{base_dir}{uri}")
+                        return f'URI="/api/v/{t}"'
                     stripped = re.sub(r'URI="([^"]+)"', replace_uri, stripped)
                 rewritten_lines.append(stripped)
                 continue
 
-            # رابط كامل (http/https)
+            # رابط كامل
             if stripped.startswith('http://') or stripped.startswith('https://'):
                 if stripped.startswith(config['base_url']):
                     rel = stripped[len(config['base_url']):]
-                    rewritten_lines.append(f'/proxy/{lesson_id}/{rel}')
+                    t = encode_path(lesson_id, rel)
+                    rewritten_lines.append(f'/api/v/{t}')
                 else:
                     rewritten_lines.append(stripped)
                 continue
 
-            # رابط يبدأ بـ / (absolute path على السيرفر)
+            # رابط absolute
             if stripped.startswith('/'):
-                rewritten_lines.append(f'/proxy/{lesson_id}{stripped}')
+                t = encode_path(lesson_id, stripped.lstrip('/'))
+                rewritten_lines.append(f'/api/v/{t}')
                 continue
 
-            # رابط نسبي (زي video0.ts أو 480p/segment.ts)
-            # نضيف الـ base_dir عشان نعرف المجلد الحالي
-            rewritten_lines.append(f'/proxy/{lesson_id}/{base_dir}{stripped}')
+            # رابط نسبي
+            t = encode_path(lesson_id, f"{base_dir}{stripped}")
+            rewritten_lines.append(f'/api/v/{t}')
 
         new_content = '\n'.join(rewritten_lines)
 
@@ -170,7 +249,7 @@ def proxy(lesson_id, file_path):
     if 'Accept-Ranges' in upstream.headers:
         response_headers['Accept-Ranges'] = upstream.headers['Accept-Ranges']
 
-    status = upstream.status_code  # 200 أو 206
+    status = upstream.status_code
 
     def generate():
         try:
