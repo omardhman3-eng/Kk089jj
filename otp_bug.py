@@ -34,13 +34,13 @@ def process_otp(otp_code, phone):
     try:
         res_get = session.get(register_url, headers=headers, timeout=10)
     except Exception as e:
-        return f'❌ Connection Error: {e}'
+        return f'Connection Error: {e}'
 
     soup = BeautifulSoup(res_get.text, 'html.parser')
     token_input = soup.find('input', {'name': '__RequestVerificationToken'})
 
     if not token_input:
-        return '❌ CSRF Protection Token not found.'
+        return 'CSRF Protection Token not found.'
 
     csrf_token = token_input['value']
 
@@ -58,7 +58,7 @@ def process_otp(otp_code, phone):
     try:
         res_post = session.post(register_url, headers=headers, data=reg_data, timeout=10)
     except Exception as e:
-        return f'❌ Connection Error on Register: {e}'
+        return f'Connection Error on Register: {e}'
 
     # Extract Data Parameter
     param_data = ''
@@ -70,7 +70,7 @@ def process_otp(otp_code, phone):
             param_data = match.group(1)
 
     if not param_data:
-        return '❌ ERROR: Failed to extract data parameter.'
+        return 'ERROR: Failed to extract data parameter.'
 
     raw_data_value = unquote(param_data)
 
@@ -79,7 +79,7 @@ def process_otp(otp_code, phone):
     try:
         res_confirm_page = session.get(confirm_url, headers=headers, timeout=10)
     except Exception as e:
-        return f'❌ Connection Error on Confirm Page: {e}'
+        return f'Connection Error on Confirm Page: {e}'
 
     soup_confirm = BeautifulSoup(res_confirm_page.text, 'html.parser')
     confirm_token_input = soup_confirm.find('input', {'name': '__RequestVerificationToken'})
@@ -95,29 +95,29 @@ def process_otp(otp_code, phone):
     try:
         final_response = session.post(confirm_url, headers=headers, data=confirm_payload, timeout=10)
     except Exception as e:
-        return f'❌ Connection Error on OTP Submit: {e}'
+        return f'Connection Error on OTP Submit: {e}'
 
     # Response Analysis
     soup_res = BeautifulSoup(final_response.text, 'html.parser')
     error_msg_tag = soup_res.find('a', {'id': 'error-message'})
 
     if error_msg_tag and error_msg_tag.text.strip():
-        return f'❌ Refused: {error_msg_tag.text.strip()}'
+        return f'Refused: {error_msg_tag.text.strip()}'
     elif (
         'Login' in final_response.url
         or 'Account/Login' in final_response.text
         or final_response.status_code == 302
     ):
-        return 'Done ✔️'
+        return 'Done'
     else:
         errors = soup_res.find_all(
             class_=re.compile(r'validation-summary-errors|red-color|text-danger')
         )
         if errors:
             err_text = ' '.join([e.text.strip() for e in errors if e.text.strip()])
-            return f'❌ Server Message: {err_text}'
+            return f'Server Message: {err_text}'
         else:
-            return 'ℹ️ Process completed, but check account status.'
+            return 'Process completed, but check account status.'
 
 
 # ---------------------------------------------------------
